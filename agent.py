@@ -1,16 +1,19 @@
-"""Medical assistant agent with tools for searching patients, sending emails, etc."""
+"""Medical assistant agent with human-in-the-loop approval for sensitive operations."""
 
 import json
 import os
 import sys
+import uuid
 
 from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 from database import search_patients, get_patient, delete_patient
+from human_approval import build_graph
 from pii_middleware import pii_redact_tool, redact_pii
 
 load_dotenv()
@@ -69,7 +72,7 @@ def search_medical_literature(query: str) -> str:
 # --- Agent setup ---
 
 def build_agent(pii_filter: bool = True):
-    """Build and return an AgentExecutor, optionally with PII redaction on tools."""
+    """Build and return a LangGraph graph with human-in-the-loop approval."""
     raw_tools = [search_patient, send_email, delete_record, search_medical_literature]
 
     if pii_filter:
@@ -77,28 +80,25 @@ def build_agent(pii_filter: bool = True):
     else:
         agent_tools = raw_tools
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful medical assistant. You help healthcare professionals look up patient information, search medical literature, and manage patient records. Be concise and professional."),
-        MessagesPlaceholder("chat_history", optional=True),
-        ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad"),
-    ])
-
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    agent = create_tool_calling_agent(llm, agent_tools, prompt)
-    return AgentExecutor(agent=agent, tools=agent_tools, verbose=True)
+    checkpointer = MemorySaver()
+    graph = build_graph(agent_tools, llm, checkpointer)
+    return graph
 
 
 # --- REPL ---
 
 def main():
     pii_filter = "--no-pii-filter" not in sys.argv
-    executor = build_agent(pii_filter=pii_filter)
+    graph = build_agent(pii_filter=pii_filter)
 
     label = "ON" if pii_filter else "OFF"
     print(f"Medical Assistant Agent (PII filter: {label}) — type 'quit' to exit")
-    print("-" * 55)
-    chat_history = []
+    print("Sensitive tools (send_email, delete_record) require human approval.")
+    print("-" * 60)
+
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
 
     while True:
         try:
@@ -111,8 +111,40 @@ def main():
             print("Goodbye!")
             break
 
-        result = executor.invoke({"input": user_input, "chat_history": chat_history})
-        output = redact_pii(result["output"]) if pii_filter else result["output"]
+        result = graph.invoke(
+            {"messages": [HumanMessage(content=user_input)]},
+            config,
+        )
+
+        # Check if the graph is interrupted (waiting for approval)
+        state = graph.get_state(config)
+        while state.next:
+            # There's an interrupt — display pending tool calls for approval
+            pending = state.tasks
+            for task in pending:
+                if hasattr(task, "interrupts") and task.interrupts:
+                    for intr in task.interrupts:
+                        info = intr.value
+                        print(f"\n*** APPROVAL REQUIRED ***")
+                        print(f"  {info['message']}")
+                        for tc in info["tool_calls"]:
+                            print(f"  - {tc['name']}({tc['args']})")
+
+            try:
+                answer = input("  Approve? (y/n): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nGoodbye!")
+                return
+
+            decision = "approve" if answer == "y" else "reject"
+            result = graph.invoke(Command(resume=decision), config)
+
+            # Check again in case of further interrupts
+            state = graph.get_state(config)
+
+        # Extract the final AI message
+        final_msg = result["messages"][-1].content if result["messages"] else ""
+        output = redact_pii(final_msg) if pii_filter else final_msg
         print(f"\nAssistant: {output}")
 
 
