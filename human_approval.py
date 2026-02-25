@@ -13,6 +13,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt, Command
 
 from input_guardrail import input_guard_node, route_after_guard
+from output_guardrail import build_output_guard_node, route_after_output_guard
 
 
 SENSITIVE_TOOLS = {"send_email", "delete_record"}
@@ -70,14 +71,6 @@ def approval_check(state: MessagesState) -> Command:
     return Command(goto="agent", update={"messages": rejection_msgs})
 
 
-def route_after_agent(state: MessagesState) -> str:
-    """Route after the agent node: if tool calls exist go to approval_check, else END."""
-    last = state["messages"][-1]
-    if isinstance(last, AIMessage) and last.tool_calls:
-        return "approval_check"
-    return END
-
-
 def build_graph(tools, llm, checkpointer):
     """Build and compile the LangGraph StateGraph with an approval gate.
 
@@ -96,13 +89,15 @@ def build_graph(tools, llm, checkpointer):
     # Nodes
     graph.add_node("input_guard", input_guard_node)
     graph.add_node("agent", lambda state: agent_node(state, llm_with_tools))
+    graph.add_node("output_guard", build_output_guard_node(llm))
     graph.add_node("approval_check", approval_check)
     graph.add_node("tools", ToolNode(tools))
 
     # Edges
     graph.set_entry_point("input_guard")
     graph.add_conditional_edges("input_guard", route_after_guard, {"agent": "agent", END: END})
-    graph.add_conditional_edges("agent", route_after_agent, {"approval_check": "approval_check", END: END})
+    graph.add_edge("agent", "output_guard")
+    graph.add_conditional_edges("output_guard", route_after_output_guard, {"approval_check": "approval_check", END: END})
     graph.add_edge("tools", "agent")
 
     return graph.compile(checkpointer=checkpointer)
